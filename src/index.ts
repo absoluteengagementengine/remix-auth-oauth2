@@ -10,6 +10,7 @@ import {
   StrategyVerifyCallback,
 } from "remix-auth";
 import { v4 as uuid } from "uuid";
+import CryptoJS from "crypto-js";
 
 let debug = createDebug("OAuth2Strategy");
 
@@ -46,6 +47,7 @@ export interface OAuth2StrategyOptions {
   scope?: string;
   responseType?: ResponseType;
   useBasicAuthenticationHeader?: boolean;
+  usePKCEFlow?: boolean;
 }
 
 export interface OAuth2StrategyVerifyParams<
@@ -117,8 +119,10 @@ export class OAuth2Strategy<
   protected responseType: ResponseType;
   protected useBasicAuthenticationHeader: boolean;
   protected scope?: string;
+  protected usePKCEFlow: boolean;
 
   private sessionStateKey = "oauth2:state";
+  private codeVerifierStateKey = "oauth2:code_verifier";
 
   constructor(
     options: OAuth2StrategyOptions,
@@ -137,6 +141,7 @@ export class OAuth2Strategy<
     this.responseType = options.responseType ?? "code";
     this.useBasicAuthenticationHeader =
       options.useBasicAuthenticationHeader ?? false;
+    this.usePKCEFlow = options.usePKCEFlow ?? false;
   }
 
   async authenticate(
@@ -164,13 +169,23 @@ export class OAuth2Strategy<
 
     // Redirect the user to the callback URL
     if (url.pathname !== callbackURL.pathname) {
+      const { codeVerifier, codeChallenge } = this.generatePKCE();
       debug("Redirecting to callback URL");
       let state = this.generateState();
       debug("State", state);
       session.set(this.sessionStateKey, state);
-      throw redirect(this.getAuthorizationURL(request, state).toString(), {
-        headers: { "Set-Cookie": await sessionStorage.commitSession(session) },
-      });
+      if (codeVerifier) {
+        session.set(this.codeVerifierStateKey, codeVerifier);
+      }
+
+      throw redirect(
+          this.getAuthorizationURL(request, state, codeChallenge).toString(),
+          {
+            headers: {
+              "Set-Cookie": await sessionStorage.commitSession(session),
+            },
+          }
+      );
     }
 
     // Validations of the callback URL params
@@ -212,6 +227,18 @@ export class OAuth2Strategy<
       );
     }
 
+    let verifier = session.get(this.codeVerifierStateKey);
+    if (this.usePKCEFlow && !verifier) {
+      return await this.failure(
+          "Missing code verifier on session.",
+          request,
+          sessionStorage,
+          options,
+          new Error("Missing code verifier on session.")
+      );
+    }
+    session.unset(this.codeVerifierStateKey);
+
     let code = url.searchParams.get("code");
     if (!code) {
       return await this.failure(
@@ -229,6 +256,9 @@ export class OAuth2Strategy<
       let params = new URLSearchParams(this.tokenParams());
       params.set("grant_type", "authorization_code");
       params.set("redirect_uri", callbackURL.toString());
+      if (verifier) {
+        params.set("code_verifier", verifier);
+      }
 
       let { accessToken, refreshToken, extraParams } =
         await this.fetchAccessToken(code, params);
@@ -356,7 +386,11 @@ export class OAuth2Strategy<
     return new URL(`${protocol}//${this.callbackURL}`);
   }
 
-  private getAuthorizationURL(request: Request, state: string) {
+  private getAuthorizationURL(
+      request: Request,
+      state: string,
+      challenge: string | null
+  ) {
     let params = new URLSearchParams(
       this.authorizationParams(new URL(request.url).searchParams),
     );
@@ -367,11 +401,36 @@ export class OAuth2Strategy<
     if (this.scope) {
       params.set("scope", this.scope);
     }
+    if (challenge) {
+      params.set("code_challenge_method", "S256");
+      params.set("code_challenge", challenge);
+    }
 
     let url = new URL(this.authorizationURL);
     url.search = params.toString();
 
     return url;
+  }
+  
+  private generatePKCE() {
+    if (!this.usePKCEFlow) {
+      return {
+        codeVerifier: null,
+        codeChallenge: null,
+      };
+    }
+
+    const codeVerifier = CryptoJS.lib.WordArray.random(96).toString(
+        CryptoJS.enc.Base64url
+    );
+    const codeChallenge = CryptoJS.SHA256(codeVerifier).toString(
+        CryptoJS.enc.Base64url
+    );
+
+    return {
+      codeVerifier,
+      codeChallenge,
+    };
   }
 
   private generateState() {
